@@ -6,9 +6,9 @@ from aiohttp import web
 
 load_dotenv()
 
-API_ID = int(os.environ["API_ID"])
-API_HASH = os.environ["API_HASH"]
-BOT_TOKEN = os.environ["BOT_TOKEN"]
+API_ID = int(os.environ["API_ID", "23361081"])
+API_HASH = os.environ["API_HASH", "0605c5395b91ead763072251e20c3417"]
+BOT_TOKEN = os.environ["BOT_TOKEN", "8864443021:AAHJsARGoeKiYZhvuVsQRKSlaURzJM2lEVI"]
 
 app = Client(
     "MNBoT",
