@@ -6,7 +6,7 @@ from aiohttp import web
 
 load_dotenv()
 
-API_ID = int(os.environ["API_ID, "23361081"])
+API_ID = int(os.environ["API_ID", "23361081"])
 API_HASH = os.environ["API_HASH", "0605c5395b91ead763072251e20c3417"]
 BOT_TOKEN = os.environ["BOT_TOKEN", "8670377375:AAH7U4nz452TXEfD8eg-PyRFPy8Qq-q8bLE"]
 
