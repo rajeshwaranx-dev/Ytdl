@@ -239,7 +239,7 @@ def clean_audio_title(filename: str) -> str:
 @Client.on_message(filters.command("start") & filters.private)
 async def cmd_start(client: Client, msg: Message):
     await msg.reply(
-        "👋 **Welcome to MN YT Downloader!**\n\n"
+        "👋 **Welcome to AskBotz YT Downloader!**\n\n"
         "**What I can do:**\n"
         "• Send a YouTube link → choose MP4 or MP3 quality\n"
         "• `/search <query>` → search YouTube and pick a video\n"
@@ -254,7 +254,7 @@ async def cmd_start(client: Client, msg: Message):
 @Client.on_message(filters.command("help") & filters.private)
 async def cmd_help(client: Client, msg: Message):
     await msg.reply(
-        "**📖 MN YT Downloader — Help**\n\n"
+        "**📖 AskBotz YT Downloader — Help**\n\n"
         "**Direct download:**\n"
         "  Send any YouTube URL. I'll show video info and ask format.\n\n"
         "**Quality selection:**\n"
