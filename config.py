@@ -20,3 +20,7 @@ class Config:
 MONGO_URI        = Config.MONGO_URI
 MONGO_DB         = Config.MONGO_DB
 REFERRALS_NEEDED = int(os.environ.get("REFERRALS_NEEDED", "5"))
+
+START_IMAGE  = os.environ.get("START_IMAGE", "https://ibb.co/DP2wDxbq")  # any image URL or file_id
+CHANNEL_LINK = os.environ.get("CHANNEL_LINK", "https://t.me/yourchannel")
+GROUP_LINK   = os.environ.get("GROUP_LINK",   "https://t.me/yourgroup")
