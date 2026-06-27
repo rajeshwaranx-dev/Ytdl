@@ -5,7 +5,7 @@ Works in both private chats and groups.
 """
 
 import logging
-from pyrogram import Client
+from pyrogram import Client, enums
 from pyrogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.errors import UserNotParticipant, ChatAdminRequired, PeerIdInvalid, FloodWait
 from database import users as users_col
@@ -79,7 +79,7 @@ async def send_force_sub_message(msg: Message) -> None:
         "1️⃣ Click <b>Join Channel</b> below\n"
         "2️⃣ Join / send a join request\n"
         "3️⃣ Come back and tap <b>✅ I Joined</b>",
-        parse_mode="html",
+        parse_mode=enums.ParseMode.HTML,
         reply_markup=markup,
         quote=True,
     )
@@ -105,7 +105,7 @@ async def handle_check_sub(client: Client, cq: CallbackQuery) -> None:
             await cq.message.edit_reply_markup(None)
             await cq.message.edit_text(
                 "✅ <b>Access granted!</b>\n\nSend me a YouTube link or use /search to get started. 🚀",
-                parse_mode="html",
+                parse_mode=enums.ParseMode.HTML,
             )
         except Exception:
             pass
@@ -127,8 +127,8 @@ async def handle_check_sub(client: Client, cq: CallbackQuery) -> None:
             await cq.message.edit_reply_markup(None)
             await cq.message.edit_text(
                 "✅ <b>Access granted!</b>\n\nSend me a YouTube link or use /search to get started. 🎉",
-                parse_mode="html",
+                parse_mode=enums.ParseMode.HTML,
             )
         except Exception:
             pass
-
+            
