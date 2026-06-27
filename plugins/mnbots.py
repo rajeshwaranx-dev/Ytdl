@@ -12,10 +12,19 @@ from pyrogram.types import (
 )
 from pyrogram.errors import FloodWait, MessageNotModified
 from config import Config
+from database import users as users_col, ensure_user
+from fsub import is_subscribed, send_force_sub_message, handle_check_sub
+from log_channel import (
+    log_download_start,
+    log_download_success,
+    log_download_error,
+    log_search,
+    log_new_user,
+)
 
 logger = logging.getLogger("mnbots.ytdl")
 
-YT_API = Config.YT_API
+YT_API      = Config.YT_API
 DOWNLOAD_DIR = Path(Config.DOWNLOAD_DIR)
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -32,22 +41,19 @@ def extract_url(text: str) -> str | None:
     return m.group(0) if m else None
 
 
-
-# Per-endpoint timeouts (seconds). mp4/mp3 can take 2–3 min for muxing.
+# Per-endpoint timeouts (seconds).
 _TIMEOUTS = {
     "info":   aiohttp.ClientTimeout(total=30),
-    "mp4":    aiohttp.ClientTimeout(total=300),   # muxing is slow
+    "mp4":    aiohttp.ClientTimeout(total=300),
     "mp3":    aiohttp.ClientTimeout(total=180),
     "search": aiohttp.ClientTimeout(total=20),
 }
 _DEFAULT_TIMEOUT = aiohttp.ClientTimeout(total=60)
-
 _MAX_RETRIES = 3
-_RETRY_DELAY = 5   # seconds between retries
+_RETRY_DELAY = 5
 
 
 async def safe_edit(msg: Message, text: str, **kwargs) -> None:
-    """Edit a message, silently ignoring MessageNotModified errors."""
     try:
         await msg.edit(text, **kwargs)
     except MessageNotModified:
@@ -58,20 +64,14 @@ async def safe_edit(msg: Message, text: str, **kwargs) -> None:
         pass
 
 
-async def api_get(
-    session: aiohttp.ClientSession,
-    path: str,
-    **params,
-) -> dict | list:
-    url = f"{YT_API}/{path}"
+async def api_get(session: aiohttp.ClientSession, path: str, **params) -> dict | list:
+    url     = f"{YT_API}/{path}"
     timeout = _TIMEOUTS.get(path, _DEFAULT_TIMEOUT)
     last_exc: Exception | None = None
 
     for attempt in range(1, _MAX_RETRIES + 1):
         try:
-            async with session.get(
-                url, params=params, timeout=timeout
-            ) as r:
+            async with session.get(url, params=params, timeout=timeout) as r:
                 r.raise_for_status()
                 return await r.json()
         except (asyncio.TimeoutError, aiohttp.ServerDisconnectedError) as e:
@@ -84,7 +84,6 @@ async def api_get(
                 await asyncio.sleep(_RETRY_DELAY)
             continue
         except aiohttp.ClientResponseError as e:
-            # 502/503/504 = gateway/worker overloaded — worth retrying
             if e.status in (502, 503, 504) and attempt < _MAX_RETRIES:
                 last_exc = e
                 logger.warning(
@@ -93,92 +92,78 @@ async def api_get(
                 )
                 await asyncio.sleep(_RETRY_DELAY)
                 continue
-            raise  # 4xx or unrecoverable 5xx — don't retry
+            raise
 
     raise asyncio.TimeoutError(
         f"/{path} did not respond after {_MAX_RETRIES} attempts"
     ) from last_exc
 
 
-async def fetch_info(session: aiohttp.ClientSession, yt_url: str) -> dict:
-    return await api_get(session, "info", url=yt_url)
+async def fetch_info(session, yt_url):   return await api_get(session, "info", url=yt_url)
+async def fetch_mp4(session, yt_url, quality=None):
+    p = {"url": yt_url}
+    if quality is not None: p["quality"] = quality
+    return await api_get(session, "mp4", **p)
+async def fetch_mp3(session, yt_url, quality=None):
+    p = {"url": yt_url}
+    if quality is not None: p["quality"] = quality
+    return await api_get(session, "mp3", **p)
 
 
-async def fetch_mp4(session: aiohttp.ClientSession, yt_url: str, quality: int | None = None) -> dict:
-    params = {"url": yt_url}
-    if quality is not None:
-        params["quality"] = quality
-    return await api_get(session, "mp4", **params)
-
-
-async def fetch_mp3(session: aiohttp.ClientSession, yt_url: str, quality: int | None = None) -> dict:
-    params = {"url": yt_url}
-    if quality is not None:
-        params["quality"] = quality
-    return await api_get(session, "mp3", **params)
-
-
-async def search_yt(session: aiohttp.ClientSession, query: str) -> list:
+async def search_yt(session, query):
     result = await api_get(session, "search", s=query)
     logger.debug("search_yt raw response type=%s value=%r", type(result).__name__, result)
     if isinstance(result, list):
         return result
     if isinstance(result, dict):
-        # try common wrapper keys
         for key in ("results", "videos", "items", "data"):
             if isinstance(result.get(key), list):
                 return result[key]
-        # dict may itself be a single video — unlikely but guard
         logger.warning("search_yt unexpected dict shape: %r", list(result.keys()))
     return []
 
 
 def progress_bar(done: int, total: int, width: int = 16) -> str:
-    pct = done / total if total else 0
+    pct    = done / total if total else 0
     filled = int(width * pct)
-    bar = "█" * filled + "░" * (width - filled)
+    bar    = "█" * filled + "░" * (width - filled)
     return f"[{bar}] {pct*100:.1f}%"
 
 
 def _fmt_size(b: int) -> str:
-    """Return a human-readable size string."""
-    if b >= 1_073_741_824:
-        return f"{b/1_073_741_824:.2f} GB"
-    if b >= 1_048_576:
-        return f"{b/1_048_576:.1f} MB"
+    if b >= 1_073_741_824: return f"{b/1_073_741_824:.2f} GB"
+    if b >= 1_048_576:     return f"{b/1_048_576:.1f} MB"
     return f"{b/1024:.1f} KB"
 
 
 def _fmt_speed(bps: float) -> str:
-    """Return a human-readable speed string."""
-    if bps >= 1_048_576:
-        return f"{bps/1_048_576:.2f} MB/s"
+    if bps >= 1_048_576: return f"{bps/1_048_576:.2f} MB/s"
     return f"{bps/1024:.1f} KB/s"
 
 
 async def download_file(url: str, dest: Path, msg: Message) -> Path:
-    start = time.time()
+    start     = time.time()
     last_edit = 0.0
     async with aiohttp.ClientSession() as session:
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=3600)) as r:
             r.raise_for_status()
             total = int(r.headers.get("Content-Length", 0))
-            done = 0
+            done  = 0
             async with aiofiles.open(dest, "wb") as f:
                 async for chunk in r.content.iter_chunked(1024 * 256):
                     await f.write(chunk)
                     done += len(chunk)
-                    now = time.time()
+                    now   = time.time()
                     if now - last_edit >= 3:
-                        last_edit = now
-                        elapsed = now - start
-                        speed = done / elapsed if elapsed else 0
-                        eta = (total - done) / speed if speed and total else 0
-                        bar = progress_bar(done, total)
-                        done_str  = _fmt_size(done)
-                        total_str = _fmt_size(total) if total else "?"
-                        speed_str = _fmt_speed(speed)
-                        eta_str   = f"{int(eta//60)}m {int(eta%60)}s" if eta >= 60 else f"{int(eta)}s"
+                        last_edit  = now
+                        elapsed    = now - start
+                        speed      = done / elapsed if elapsed else 0
+                        eta        = (total - done) / speed if speed and total else 0
+                        bar        = progress_bar(done, total)
+                        done_str   = _fmt_size(done)
+                        total_str  = _fmt_size(total) if total else "?"
+                        speed_str  = _fmt_speed(speed)
+                        eta_str    = f"{int(eta//60)}m {int(eta%60)}s" if eta >= 60 else f"{int(eta)}s"
                         try:
                             await msg.edit(
                                 f"⬇️ **Downloading...**\n"
@@ -193,12 +178,12 @@ async def download_file(url: str, dest: Path, msg: Message) -> Path:
     return dest
 
 
-def quality_buttons(qualities: list, vid_id: str, kind: str) -> InlineKeyboardMarkup:
+def quality_buttons(qualities, vid_id, kind):
     buttons = []
-    row = []
+    row     = []
     for q in qualities:
         label = f"{q}p" if kind == "mp4" else f"{q}kbps"
-        cb = f"dl:{kind}:{vid_id}:{q}"
+        cb    = f"dl:{kind}:{vid_id}:{q}"
         row.append(InlineKeyboardButton(label, callback_data=cb))
         if len(row) == 3:
             buttons.append(row)
@@ -209,11 +194,11 @@ def quality_buttons(qualities: list, vid_id: str, kind: str) -> InlineKeyboardMa
     return InlineKeyboardMarkup(buttons)
 
 
-def search_result_buttons(results: list) -> InlineKeyboardMarkup:
+def search_result_buttons(results):
     buttons = []
-    videos = [r for r in results if r.get("type") == "video"][:8]
+    videos  = [r for r in results if r.get("type") == "video"][:8]
     for v in videos:
-        title = v["title"][:40]
+        title  = v["title"][:40]
         vid_id = v["videoId"]
         buttons.append([InlineKeyboardButton(f"▶ {title}", callback_data=f"sr:{vid_id}")])
     buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="dl:cancel")])
@@ -226,18 +211,51 @@ def vid_id_from_url(url: str) -> str:
 
 
 def clean_audio_title(filename: str) -> str:
-    # BUG FIX 3: original rsplit("(", 1)[0] crashes cleanly but gives ugly result
-    # on filenames without "(" — strip extension and trailing junk instead
-    name = Path(filename).stem  # drop .mp3
-    # Remove trailing bracketed quality tags like "(128kbps)" or "[HQ]"
+    name = Path(filename).stem
     name = re.sub(r"[\(\[][^\)\]]*[\)\]]$", "", name).strip()
     return name or filename
 
 
+# ─── fsub guard decorator ────────────────────────────────────────────────────
+
+def fsub_required(func):
+    """
+    Decorator for message handlers.
+    Blocks the handler and shows the force-sub prompt if user is not subscribed.
+    Also ensures the user exists in DB on every call.
+    """
+    async def wrapper(client: Client, msg: Message):
+        user = msg.from_user
+        if not user:
+            return  # ignore anonymous/channel messages
+
+        # Ensure user record exists
+        ensure_user({
+            "id":         user.id,
+            "first_name": user.first_name or "",
+            "last_name":  user.last_name  or "",
+            "username":   user.username   or "",
+        })
+
+        if not await is_subscribed(client, user.id):
+            await send_force_sub_message(msg)
+            return
+
+        return await func(client, msg)
+    return wrapper
+
+
 # ─── /start ─────────────────────────────────────────────────────────────────
 
-@Client.on_message(filters.command("start") & filters.private)
+@Client.on_message(filters.command("start"))
+@fsub_required
 async def cmd_start(client: Client, msg: Message):
+    user     = msg.from_user
+    is_new   = users_col.find_one({"_id": user.id, "downloads": 0}) is not None
+
+    if is_new:
+        await log_new_user(client, user)
+
     await msg.reply(
         "👋 **Welcome to AskBotz YT Downloader!**\n\n"
         "**What I can do:**\n"
@@ -251,7 +269,8 @@ async def cmd_start(client: Client, msg: Message):
 
 # ─── /help ──────────────────────────────────────────────────────────────────
 
-@Client.on_message(filters.command("help") & filters.private)
+@Client.on_message(filters.command("help"))
+@fsub_required
 async def cmd_help(client: Client, msg: Message):
     await msg.reply(
         "**📖 AskBotz YT Downloader — Help**\n\n"
@@ -273,10 +292,14 @@ async def cmd_help(client: Client, msg: Message):
 # ─── /search ────────────────────────────────────────────────────────────────
 
 @Client.on_message(filters.command("search"))
+@fsub_required
 async def cmd_search(client: Client, msg: Message):
     query = msg.text.split(None, 1)[1].strip() if len(msg.text.split()) > 1 else ""
     if not query:
         return await msg.reply("Usage: `/search <query>`", quote=True)
+
+    # Log the search query
+    await log_search(client, msg.from_user, query)
 
     status = await msg.reply("🔍 Searching YouTube...", quote=True)
     try:
@@ -301,8 +324,8 @@ async def cmd_search(client: Client, msg: Message):
 # ─── YouTube URL handler ─────────────────────────────────────────────────────
 
 @Client.on_message(filters.text & ~filters.command(["start", "help", "search"]))
+@fsub_required
 async def handle_url(client: Client, msg: Message):
-    # BUG FIX 4: guard against None msg.text (e.g. captions, edited messages)
     if not msg.text:
         return
 
@@ -317,8 +340,8 @@ async def handle_url(client: Client, msg: Message):
     except Exception as e:
         return await safe_edit(status, f"❌ Failed to fetch info: `{e}`")
 
-    title = info.get("title", "Unknown")
-    thumb = info.get("thumbnail", "")
+    title  = info.get("title", "Unknown")
+    thumb  = info.get("thumbnail", "")
     vid_id = vid_id_from_url(yt_url)
 
     markup = InlineKeyboardMarkup([
@@ -340,12 +363,14 @@ async def handle_url(client: Client, msg: Message):
         await safe_edit(status, caption, reply_markup=markup)
 
 
-# ─── Callback: cancel ─────────────────────────────────────────────────────────
-# BUG FIX 5: cancel handler MUST be registered before the dl download handler.
-# Pyrogram matches callbacks in registration order. Since dl:cancel matches the
-# broader dl:(mp4|mp3) pattern only if placed after, but the download regex
-# ^dl:(mp4|mp3):(.+):(\d+)$ won't match "dl:cancel" anyway — however placing
-# cancel first is safer and avoids any future regex overlap issues.
+# ─── Callback: "I Joined" check ──────────────────────────────────────────────
+
+@Client.on_callback_query(filters.regex(r"^check_sub$"))
+async def cb_check_sub(client: Client, cq: CallbackQuery):
+    await handle_check_sub(client, cq)
+
+
+# ─── Callback: cancel ────────────────────────────────────────────────────────
 
 @Client.on_callback_query(filters.regex(r"^dl:cancel$"))
 async def cb_cancel(client: Client, cq: CallbackQuery):
@@ -361,15 +386,17 @@ async def cb_cancel(client: Client, cq: CallbackQuery):
 
 @Client.on_callback_query(filters.regex(r"^fmt:(mp4|mp3):(.+)$"))
 async def cb_format(client: Client, cq: CallbackQuery):
-    parts = cq.data.split(":", 2)
-    kind = parts[1]
+    # fsub check for callbacks too
+    if not await is_subscribed(client, cq.from_user.id):
+        await cq.answer("⚠️ Please join the channel first!", show_alert=True)
+        return
+
+    parts  = cq.data.split(":", 2)
+    kind   = parts[1]
     vid_id = parts[2]
     yt_url = f"https://youtu.be/{vid_id}"
 
-    # BUG FIX 6: answer() must be called within 5s or Telegram shows "loading"
-    # indefinitely. Answer before any async API work.
     await cq.answer("Fetching qualities...")
-
     try:
         await cq.message.edit_reply_markup(None)
     except Exception:
@@ -378,10 +405,7 @@ async def cb_format(client: Client, cq: CallbackQuery):
     status = await cq.message.reply("⏳ Fetching available qualities...")
     try:
         async with aiohttp.ClientSession() as session:
-            if kind == "mp4":
-                data = await fetch_mp4(session, yt_url)
-            else:
-                data = await fetch_mp3(session, yt_url)
+            data = await fetch_mp4(session, yt_url) if kind == "mp4" else await fetch_mp3(session, yt_url)
     except Exception as e:
         return await safe_edit(status, f"❌ Error: `{e}`")
 
@@ -390,8 +414,9 @@ async def cb_format(client: Client, cq: CallbackQuery):
         return await safe_edit(status, "❌ No qualities available.")
 
     markup = quality_buttons(qualities, vid_id, kind)
-    icon = "🎬" if kind == "mp4" else "🎵"
-    await safe_edit(status, 
+    icon   = "🎬" if kind == "mp4" else "🎵"
+    await safe_edit(
+        status,
         f"{icon} Select quality for **{'Video' if kind == 'mp4' else 'Audio'}**:",
         reply_markup=markup
     )
@@ -401,11 +426,15 @@ async def cb_format(client: Client, cq: CallbackQuery):
 
 @Client.on_callback_query(filters.regex(r"^sr:(.+)$"))
 async def cb_search_result(client: Client, cq: CallbackQuery):
+    # fsub check for callbacks too
+    if not await is_subscribed(client, cq.from_user.id):
+        await cq.answer("⚠️ Please join the channel first!", show_alert=True)
+        return
+
     vid_id = cq.data.split(":", 1)[1]
     yt_url = f"https://youtu.be/{vid_id}"
 
     await cq.answer()
-
     try:
         await cq.message.edit_reply_markup(None)
     except Exception:
@@ -444,29 +473,34 @@ async def cb_search_result(client: Client, cq: CallbackQuery):
 
 @Client.on_callback_query(filters.regex(r"^dl:(mp4|mp3):(.+):(\d+)$"))
 async def cb_download(client: Client, cq: CallbackQuery):
-    parts = cq.data.split(":", 3)
-    kind = parts[1]
-    vid_id = parts[2]
+    # fsub check for callbacks too
+    if not await is_subscribed(client, cq.from_user.id):
+        await cq.answer("⚠️ Please join the channel first!", show_alert=True)
+        return
+
+    parts   = cq.data.split(":", 3)
+    kind    = parts[1]
+    vid_id  = parts[2]
     quality = int(parts[3])
-    yt_url = f"https://youtu.be/{vid_id}"
+    yt_url  = f"https://youtu.be/{vid_id}"
+    user    = cq.from_user
 
     await cq.answer("Starting download...")
-
     try:
         await cq.message.edit_reply_markup(None)
     except Exception:
         pass
 
-    status = await cq.message.reply("⚙️ **Processing...** `0s elapsed`")
+    # Log that download started
+    await log_download_start(client, user, yt_url, kind, quality)
 
-    # dest must be None-initialised before try so finally can always reference it
+    status = await cq.message.reply("⚙️ **Processing...** `0s elapsed`")
     dest: Path | None = None
 
     async def _processing_ticker(msg: Message, stop: asyncio.Event) -> None:
-        """Edit the status message every 5 s with elapsed time while API works."""
-        start = time.time()
+        start   = time.time()
         spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
-        i = 0
+        i       = 0
         while not stop.is_set():
             await asyncio.sleep(5)
             if stop.is_set():
@@ -485,43 +519,46 @@ async def cb_download(client: Client, cq: CallbackQuery):
                 pass
             i += 1
 
-    _stop_ticker = asyncio.Event()
-    _ticker_task = asyncio.create_task(_processing_ticker(status, _stop_ticker))
+    _stop_ticker  = asyncio.Event()
+    _ticker_task  = asyncio.create_task(_processing_ticker(status, _stop_ticker))
 
     try:
         async with aiohttp.ClientSession() as session:
-            if kind == "mp4":
-                data = await fetch_mp4(session, yt_url, quality)
-            else:
-                data = await fetch_mp3(session, yt_url, quality)
-    except Exception:
+            data = await fetch_mp4(session, yt_url, quality) if kind == "mp4" else await fetch_mp3(session, yt_url, quality)
+    except Exception as e:
         _stop_ticker.set()
         await _ticker_task
-        raise
+        await safe_edit(status, f"❌ Failed: `{e}`")
+        await log_download_error(client, user, yt_url, kind, e, quality)
+        return
     finally:
         _stop_ticker.set()
 
     try:
         if not data.get("status"):
-            await safe_edit(status, "❌ API returned failure status.")
+            err = "API returned failure status."
+            await safe_edit(status, f"❌ {err}")
+            await log_download_error(client, user, yt_url, kind, err, quality)
             return
 
         dl_url = data.get("url")
         if not dl_url:
-            await safe_edit(status, "❌ API did not return a download URL.")
+            err = "API did not return a download URL."
+            await safe_edit(status, f"❌ {err}")
+            await log_download_error(client, user, yt_url, kind, err, quality)
             return
 
         filename = data.get("filename", f"{vid_id}.{kind}")
-        q_label = data.get("quality", str(quality))
-
-        dest = DOWNLOAD_DIR / filename
+        q_label  = data.get("quality", str(quality))
+        title    = data.get("title", clean_audio_title(filename))
+        dest     = DOWNLOAD_DIR / filename
 
         # Download
         await safe_edit(status, "⬇️ **Downloading...**\n`Starting...`")
         await download_file(dl_url, dest, status)
 
         file_size = dest.stat().st_size
-        size_mb = file_size / 1e6
+        size_mb   = file_size / 1e6
 
         # Upload to Telegram
         await safe_edit(status, f"📤 **Uploading** `{filename}`...")
@@ -532,13 +569,11 @@ async def cb_download(client: Client, cq: CallbackQuery):
         )
 
         async def _upload_progress(current: int, total: int) -> None:
-            """Pyrogram upload progress callback — fires every ~512 KB."""
             now = time.time()
-            # throttle edits to every 3 s to avoid flood
             if now - _upload_progress.last_edit < 3 and current < total:
                 return
             _upload_progress.last_edit = now
-            bar = progress_bar(current, total)
+            bar       = progress_bar(current, total)
             done_str  = _fmt_size(current)
             total_str = _fmt_size(total)
             elapsed   = now - _upload_progress.start
@@ -557,10 +592,13 @@ async def cb_download(client: Client, cq: CallbackQuery):
         _upload_progress.start     = time.time()
 
         if size_mb > Config.MAX_FILE_SIZE:
-            await safe_edit(status,
+            await safe_edit(
+                status,
                 f"⚠️ File is `{size_mb:.0f} MB`, too large to send via Telegram.\n"
                 f"[Direct Download Link]({dl_url})"
             )
+            # Log success (no file to forward, use None)
+            await log_download_success(client, user, yt_url, kind, q_label, None, title)
         elif kind == "mp4":
             await cq.message.reply_video(
                 str(dest),
@@ -569,6 +607,7 @@ async def cb_download(client: Client, cq: CallbackQuery):
                 progress=_upload_progress,
             )
             await status.delete()
+            await log_download_success(client, user, yt_url, kind, q_label, dest, title)
         else:
             await cq.message.reply_audio(
                 str(dest),
@@ -577,18 +616,20 @@ async def cb_download(client: Client, cq: CallbackQuery):
                 progress=_upload_progress,
             )
             await status.delete()
+            await log_download_success(client, user, yt_url, kind, q_label, dest, title)
 
     except FloodWait as e:
         await asyncio.sleep(e.value)
         await safe_edit(status, "⚠️ Hit flood limit, please retry.")
+        await log_download_error(client, user, yt_url, kind, "FloodWait hit during upload", quality)
     except Exception as e:
         logger.exception("Download/upload failed for %s", vid_id)
         try:
             await safe_edit(status, f"❌ Failed: `{e}`")
         except Exception:
             pass
+        await log_download_error(client, user, yt_url, kind, e, quality)
     finally:
-        # BUG FIX 9: dest may be None if exception occurred before assignment
         if dest is not None:
             try:
                 if dest.exists():
