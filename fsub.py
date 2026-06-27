@@ -148,10 +148,8 @@ async def handle_check_sub(client: Client, cq: CallbackQuery) -> None:
     )
     try:
         await cq.message.edit_text(
-            "⏳ <b>Join request pending approval.</b>\n\n"
-            "You have been granted temporary access.\n"
-            "Once an admin approves your request you'll be a full member. 🎉\n\n"
-            "Send me a YouTube link or use /search to get started.",
+            "✅ <b>Access granted!</b>\n\n"
+            "Send me a YouTube link or use /search to get started. 🎉",
             parse_mode=enums.ParseMode.HTML,
             reply_markup=None,
         )
