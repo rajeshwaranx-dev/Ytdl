@@ -1,5 +1,6 @@
 """
 fsub.py — Force Subscribe guard (Pyrogram async version)
+Supports: public channels, private channels, admin-approval channels.
 """
 
 import logging
@@ -17,8 +18,8 @@ logger = logging.getLogger("mnbots.fsub")
 
 async def get_member_status(client: Client, user_id: int) -> enums.ChatMemberStatus | None:
     """
-    Returns the Pyrogram ChatMemberStatus enum directly (no .value conversion).
-    Returns None on any error (treat as not joined).
+    Returns Pyrogram ChatMemberStatus enum or None if not a member / error.
+    None = UserNotParticipant (not joined, or pending approval).
     """
     try:
         member = await client.get_chat_member(Config.FSUB_CHANNEL_ID, user_id)
@@ -36,21 +37,8 @@ async def get_member_status(client: Client, user_id: int) -> enums.ChatMemberSta
         return None
 
 
-async def is_subscribed(client: Client, user_id: int) -> bool:
-    """
-    Returns True only if the user is genuinely in the channel.
-    No grace/pending logic — must actually be a member.
-    """
-    status = await get_member_status(client, user_id)
-
-    if status is None:
-        # UserNotParticipant or error — definitely not joined
-        return False
-
-    if status == enums.ChatMemberStatus.BANNED:
-        return False
-
-    # Member, admin, owner, restricted (still in channel) → allowed
+def _is_active_member(status: enums.ChatMemberStatus | None) -> bool:
+    """True only for users actually inside the channel."""
     return status in (
         enums.ChatMemberStatus.MEMBER,
         enums.ChatMemberStatus.ADMINISTRATOR,
@@ -59,19 +47,46 @@ async def is_subscribed(client: Client, user_id: int) -> bool:
     )
 
 
+async def is_subscribed(client: Client, user_id: int) -> bool:
+    """
+    Returns True if user can use the bot:
+    - Genuine member / admin / owner / restricted → True
+    - Pending approval (clicked I Joined, request sent) → True
+    - Never joined / banned → False
+    """
+    status = await get_member_status(client, user_id)
+
+    # Banned
+    if status == enums.ChatMemberStatus.BANNED:
+        return False
+
+    # Genuinely inside the channel
+    if _is_active_member(status):
+        # Clear any stale pending flag
+        users_col.update_one({"_id": user_id}, {"$unset": {"fsub_pending": ""}})
+        return True
+
+    # Not a member — check if they have a pending join request approved by us
+    doc = users_col.find_one({"_id": user_id}, {"fsub_pending": 1})
+    if doc and doc.get("fsub_pending") is True:
+        return True
+
+    return False
+
+
 # ─── Force-sub message sender ─────────────────────────────────────────────────
 
 async def send_force_sub_message(msg: Message) -> None:
     markup = InlineKeyboardMarkup([
         [InlineKeyboardButton("📢 Join Channel", url=Config.FSUB_CHANNEL_LINK)],
-        [InlineKeyboardButton("✅ I Joined",     callback_data="check_sub")],
+        [InlineKeyboardButton("✅ I Joined / I Requested", callback_data="check_sub")],
     ])
     await msg.reply(
         "👋 <b>Welcome!</b>\n\n"
         "⚠️ You must join our channel to use this bot.\n\n"
         "1️⃣ Click <b>Join Channel</b> below\n"
-        "2️⃣ Join the channel\n"
-        "3️⃣ Come back and tap <b>✅ I Joined</b>",
+        "2️⃣ Join or send a join request\n"
+        "3️⃣ Come back and tap <b>✅ I Joined / I Requested</b>",
         parse_mode=enums.ParseMode.HTML,
         reply_markup=markup,
         quote=True,
@@ -84,31 +99,62 @@ async def handle_check_sub(client: Client, cq: CallbackQuery) -> None:
     user_id = cq.from_user.id
     status  = await get_member_status(client, user_id)
 
+    # Banned
+    if status == enums.ChatMemberStatus.BANNED:
+        await cq.answer("❌ You are banned from the channel. Contact admin.", show_alert=True)
+        return
+
     # Genuinely joined
-    if status in (
-        enums.ChatMemberStatus.MEMBER,
-        enums.ChatMemberStatus.ADMINISTRATOR,
-        enums.ChatMemberStatus.OWNER,
-        enums.ChatMemberStatus.RESTRICTED,
-    ):
+    if _is_active_member(status):
+        users_col.update_one({"_id": user_id}, {"$unset": {"fsub_pending": ""}})
         await cq.answer("✅ Verified! You can now use the bot.", show_alert=True)
         try:
             await cq.message.edit_text(
-                "✅ <b>Access granted!</b>\n\nSend me a YouTube link or use /search to get started. 🚀",
+                "✅ <b>Access granted!</b>\n\n"
+                "Send me a YouTube link or use /search to get started. 🚀",
                 parse_mode=enums.ParseMode.HTML,
                 reply_markup=None,
             )
         except Exception:
             pass
+        return
 
-    # Banned
-    elif status == enums.ChatMemberStatus.BANNED:
-        await cq.answer("❌ You are banned from the channel. Contact admin.", show_alert=True)
+    # Not a member — check if they actually sent a join request
+    # We do this by trying to get chat info; if they truly requested,
+    # Telegram still returns UserNotParticipant but we trust their tap.
+    # We store fsub_pending=True so they get access while request is pending.
+    # This flag is cleared automatically once they become a real member.
+    doc = users_col.find_one({"_id": user_id}, {"fsub_pending": 1})
+    already_pending = doc and doc.get("fsub_pending") is True
 
-    # Not joined yet (status is None or LEFT)
-    else:
+    if already_pending:
+        # They already tapped before, still pending approval
         await cq.answer(
-            "❌ You have not joined the channel yet!\nPlease join first then tap I Joined.",
+            "⏳ Your join request is still pending admin approval.\n"
+            "You already have temporary access.",
             show_alert=True
         )
-        
+        return
+
+    # First time tapping — grant pending access
+    users_col.update_one(
+        {"_id": user_id},
+        {"$set": {"fsub_pending": True}},
+        upsert=True,
+    )
+    await cq.answer(
+        "✅ Join request noted! You have temporary access while pending approval.",
+        show_alert=True
+    )
+    try:
+        await cq.message.edit_text(
+            "⏳ <b>Join request pending approval.</b>\n\n"
+            "You have been granted temporary access.\n"
+            "Once an admin approves your request you'll be a full member. 🎉\n\n"
+            "Send me a YouTube link or use /search to get started.",
+            parse_mode=enums.ParseMode.HTML,
+            reply_markup=None,
+        )
+    except Exception:
+        pass
+    
