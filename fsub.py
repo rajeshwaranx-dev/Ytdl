@@ -1,10 +1,9 @@
 """
 fsub.py — Force Subscribe guard (Pyrogram async version)
-Checks if a user has joined the required channel before using the bot.
-Works in both private chats and groups.
 """
 
 import logging
+import asyncio
 from pyrogram import Client, enums
 from pyrogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.errors import UserNotParticipant, ChatAdminRequired, PeerIdInvalid, FloodWait
@@ -16,59 +15,53 @@ logger = logging.getLogger("mnbots.fsub")
 
 # ─── Core membership check ────────────────────────────────────────────────────
 
-async def get_member_status(client: Client, user_id: int) -> str:
+async def get_member_status(client: Client, user_id: int) -> enums.ChatMemberStatus | None:
     """
-    Returns Telegram membership status string:
-    'member' | 'administrator' | 'creator' | 'restricted' | 'left' | 'kicked'
-    Falls back to 'left' on any error.
+    Returns the Pyrogram ChatMemberStatus enum directly (no .value conversion).
+    Returns None on any error (treat as not joined).
     """
     try:
         member = await client.get_chat_member(Config.FSUB_CHANNEL_ID, user_id)
-        return member.status.value  # Pyrogram ChatMemberStatus enum → string
+        return member.status
     except UserNotParticipant:
-        return "left"
+        return None
     except (ChatAdminRequired, PeerIdInvalid) as e:
         logger.error("fsub: cannot check channel %s — %s", Config.FSUB_CHANNEL_ID, e)
-        return "left"
+        return None
     except FloodWait as e:
-        import asyncio
         await asyncio.sleep(e.value)
-        return "left"
+        return None
     except Exception as e:
         logger.warning("fsub: get_member_status unexpected error: %s", e)
-        return "left"
+        return None
 
 
 async def is_subscribed(client: Client, user_id: int) -> bool:
     """
-    Returns True if the user is allowed to use the bot:
-    - Fully joined / admin / creator / restricted → always True
-    - Kicked → always False
-    - Left → True only if they clicked 'I Joined' (pending_agreed flag in DB)
+    Returns True only if the user is genuinely in the channel.
+    No grace/pending logic — must actually be a member.
     """
     status = await get_member_status(client, user_id)
 
-    if status in ("member", "administrator", "creator", "restricted"):
-        # Clear any stale pending flag
-        users_col.update_one({"_id": user_id}, {"$unset": {"pending_agreed": ""}})
-        return True
-
-    if status == "kicked":
-        users_col.update_one({"_id": user_id}, {"$unset": {"pending_agreed": ""}})
+    if status is None:
+        # UserNotParticipant or error — definitely not joined
         return False
 
-    # status == "left" — check pending_agreed flag set when user clicked "I Joined"
-    doc = users_col.find_one({"_id": user_id}, {"pending_agreed": 1})
-    if doc and doc.get("pending_agreed") is True:
-        return True
+    if status == enums.ChatMemberStatus.BANNED:
+        return False
 
-    return False
+    # Member, admin, owner, restricted (still in channel) → allowed
+    return status in (
+        enums.ChatMemberStatus.MEMBER,
+        enums.ChatMemberStatus.ADMINISTRATOR,
+        enums.ChatMemberStatus.OWNER,
+        enums.ChatMemberStatus.RESTRICTED,
+    )
 
 
 # ─── Force-sub message sender ─────────────────────────────────────────────────
 
 async def send_force_sub_message(msg: Message) -> None:
-    """Send the join-channel prompt as a reply to the user's message."""
     markup = InlineKeyboardMarkup([
         [InlineKeyboardButton("📢 Join Channel", url=Config.FSUB_CHANNEL_LINK)],
         [InlineKeyboardButton("✅ I Joined",     callback_data="check_sub")],
@@ -77,7 +70,7 @@ async def send_force_sub_message(msg: Message) -> None:
         "👋 <b>Welcome!</b>\n\n"
         "⚠️ You must join our channel to use this bot.\n\n"
         "1️⃣ Click <b>Join Channel</b> below\n"
-        "2️⃣ Join / send a join request\n"
+        "2️⃣ Join the channel\n"
         "3️⃣ Come back and tap <b>✅ I Joined</b>",
         parse_mode=enums.ParseMode.HTML,
         reply_markup=markup,
@@ -88,47 +81,34 @@ async def send_force_sub_message(msg: Message) -> None:
 # ─── "I Joined" callback handler ──────────────────────────────────────────────
 
 async def handle_check_sub(client: Client, cq: CallbackQuery) -> None:
-    """
-    Called when the user taps '✅ I Joined'.
-    Re-checks membership and responds accordingly.
-    Register this in your plugin with:
-        @Client.on_callback_query(filters.regex(r"^check_sub$"))
-    """
     user_id = cq.from_user.id
     status  = await get_member_status(client, user_id)
 
-    if status in ("member", "administrator", "creator", "restricted"):
-        # Confirmed joined — clean up DB and grant access
-        users_col.update_one({"_id": user_id}, {"$unset": {"pending_agreed": ""}})
+    # Genuinely joined
+    if status in (
+        enums.ChatMemberStatus.MEMBER,
+        enums.ChatMemberStatus.ADMINISTRATOR,
+        enums.ChatMemberStatus.OWNER,
+        enums.ChatMemberStatus.RESTRICTED,
+    ):
         await cq.answer("✅ Verified! You can now use the bot.", show_alert=True)
         try:
-            await cq.message.edit_reply_markup(None)
             await cq.message.edit_text(
                 "✅ <b>Access granted!</b>\n\nSend me a YouTube link or use /search to get started. 🚀",
                 parse_mode=enums.ParseMode.HTML,
+                reply_markup=None,
             )
         except Exception:
             pass
 
-    elif status == "kicked":
-        users_col.update_one({"_id": user_id}, {"$unset": {"pending_agreed": ""}})
+    # Banned
+    elif status == enums.ChatMemberStatus.BANNED:
         await cq.answer("❌ You are banned from the channel. Contact admin.", show_alert=True)
 
+    # Not joined yet (status is None or LEFT)
     else:
-        # Still not joined — set pending_agreed so they get one grace attempt
-        # (Handles private/approval-required channels where status stays "left")
-        users_col.update_one(
-            {"_id": user_id},
-            {"$set": {"pending_agreed": True}},
-            upsert=True,
+        await cq.answer(
+            "❌ You have not joined the channel yet!\nPlease join first then tap I Joined.",
+            show_alert=True
         )
-        await cq.answer("✅ Access granted! Welcome.", show_alert=True)
-        try:
-            await cq.message.edit_reply_markup(None)
-            await cq.message.edit_text(
-                "✅ <b>Access granted!</b>\n\nSend me a YouTube link or use /search to get started. 🎉",
-                parse_mode=enums.ParseMode.HTML,
-            )
-        except Exception:
-            pass
-            
+        
