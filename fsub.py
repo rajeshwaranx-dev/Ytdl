@@ -1,135 +1,149 @@
 """
-fsub.py — Force Subscribe guard (Pyrogram async version)
-Uses raw Telegram HTTP API for member check (same as Instagram bot)
-to avoid Pyrogram enum issues.
+fsub.py — Force Subscribe for YouTube Downloader Bot
+Checked only when user requests a download.
+No DB flags — live membership check every time.
+No fake bypass possible.
 """
 
-import logging
 import asyncio
-import aiohttp
-from pyrogram import Client, enums, filters
-from pyrogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, ChatJoinRequest
-from database import users as users_col
+import logging
+from pyrogram import Client, filters, enums
+from pyrogram.errors import UserNotParticipant, ChatAdminRequired
+from pyrogram.types import (
+    Message, CallbackQuery,
+    InlineKeyboardButton, InlineKeyboardMarkup
+)
 from config import Config
 
-logger = logging.getLogger("mnbots.fsub")
+logger = logging.getLogger(__name__)
+
+# Cache for invite link (avoids creating new one every check)
+_invite_cache: str | None = None
 
 
-# ─── Member check via raw HTTP (returns plain string like "member", "left") ──
+# ─── Core check ──────────────────────────────────────────────────────────────
 
-async def get_member_status(user_id: int) -> str:
+async def check_fsub(bot: Client, user_id: int) -> InlineKeyboardButton | None:
     """
-    Uses raw Telegram Bot API to get membership status.
-    Returns: 'member' | 'administrator' | 'creator' | 'restricted' | 'left' | 'kicked'
-    Falls back to 'left' on any error.
+    Check if user has joined the fsub channel.
+    Returns an InlineKeyboardButton (join button) if not joined, else None.
     """
-    url = f"https://api.telegram.org/bot{Config.BOT_TOKEN}/getChatMember"
+    global _invite_cache
+
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, params={
-                "chat_id": Config.FSUB_CHANNEL_ID,
-                "user_id": user_id,
-            }, timeout=aiohttp.ClientTimeout(total=10)) as r:
-                data = await r.json()
-                status = data.get("result", {}).get("status", "left")
-                logger.info("fsub: user=%s status=%s", user_id, status)
-                return status
-    except Exception as e:
-        logger.warning("fsub: get_member_status error: %s", e)
-        return "left"
+        member = await bot.get_chat_member(Config.FSUB_CHANNEL_ID, user_id)
+        if member.status == enums.ChatMemberStatus.BANNED:
+            raise UserNotParticipant
+        return None  # ✅ User is a member
 
-
-async def is_subscribed(client, user_id: int) -> bool:
-    status = await get_member_status(user_id)
-
-    # Fully approved member
-    if status in ("member", "administrator", "creator", "restricted"):
-        users_col.update_one({"_id": user_id}, {"$unset": {"pending_agreed": ""}})
-        return True
-
-    # Banned
-    if status == "kicked":
-        users_col.update_one({"_id": user_id}, {"$unset": {"pending_agreed": ""}})
-        return False
-
-    # Left or pending — check if they clicked "I Joined"
-    doc = users_col.find_one({"_id": user_id}, {"pending_agreed": 1})
-    if doc and doc.get("pending_agreed") is True:
-        return True
-
-    return False
-
-
-# ─── ChatJoinRequest handler ──────────────────────────────────────────────────
-
-@Client.on_chat_join_request(filters.chat(str(Config.FSUB_CHANNEL_ID)))
-async def on_join_request(client: Client, request: ChatJoinRequest):
-    user_id = request.from_user.id
-    logger.info("fsub: join request from user_id=%d", user_id)
-    users_col.update_one(
-        {"_id": user_id},
-        {"$set": {"pending_agreed": True}},
-        upsert=True,
-    )
-
-
-# ─── Force-sub message ────────────────────────────────────────────────────────
-
-async def send_force_sub_message(msg: Message) -> None:
-    markup = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📢 Join Channel", url=Config.FSUB_CHANNEL_LINK)],
-        [InlineKeyboardButton("✅ I Joined",     callback_data="check_sub")],
-    ])
-    await msg.reply(
-        "👋 <b>Welcome!</b>\n\n"
-        "⚠️ You must join our channel to use this bot.\n\n"
-        "1️⃣ Click <b>Join Channel</b> below\n"
-        "2️⃣ Join or send a join request\n"
-        "3️⃣ Come back and tap <b>✅ I Joined</b>",
-        parse_mode=enums.ParseMode.HTML,
-        reply_markup=markup,
-        quote=True,
-    )
-
-
-# ─── "I Joined" callback ─────────────────────────────────────────────────────
-
-async def handle_check_sub(client: Client, cq: CallbackQuery) -> None:
-    user_id = cq.from_user.id
-    status  = await get_member_status(user_id)
-
-    if status == "kicked":
-        await cq.answer("❌ You are banned from the channel. Contact admin.", show_alert=True)
-        return
-
-    if status in ("member", "administrator", "creator", "restricted"):
-        users_col.update_one({"_id": user_id}, {"$unset": {"pending_agreed": ""}})
-        await cq.answer("✅ Verified! You can now use the bot.", show_alert=True)
+    except UserNotParticipant:
         try:
-            await cq.message.edit_text(
-                "✅ <b>Access granted!</b>\n\n"
-                "Send me a YouTube link or use /search to get started. 🎉",
+            chat = await bot.get_chat(Config.FSUB_CHANNEL_ID)
+
+            # Use cached invite link or create new one
+            if not _invite_cache:
+                invite = await bot.create_chat_invite_link(
+                    Config.FSUB_CHANNEL_ID,
+                    creates_join_request=True  # supports approval-required channels
+                )
+                _invite_cache = invite.invite_link
+
+            return InlineKeyboardButton(
+                f"📢 Join {chat.title}",
+                url=_invite_cache
+            )
+        except ChatAdminRequired:
+            # Bot not admin — fall back to config link
+            logger.warning("fsub: bot is not admin in FSUB_CHANNEL_ID, using config link")
+            return InlineKeyboardButton("📢 Join Channel", url=Config.FSUB_CHANNEL_LINK)
+        except Exception as e:
+            logger.warning("fsub: could not create invite link: %s", e)
+            return InlineKeyboardButton("📢 Join Channel", url=Config.FSUB_CHANNEL_LINK)
+
+    except Exception as e:
+        logger.exception("fsub: unexpected error for user %s: %s", user_id, e)
+        return None
+
+
+async def get_fsub_buttons(bot: Client, user_id: int) -> list:
+    """
+    Returns list of button rows if user hasn't joined.
+    Empty list [] means user passed fsub check.
+    """
+    btn = await check_fsub(bot, user_id)
+    if btn:
+        return [[btn]]
+    return []
+
+
+# ─── Decorator ───────────────────────────────────────────────────────────────
+
+def fsub_required(func):
+    """
+    Decorator — checks fsub before running any download handler.
+    Only blocks if user hasn't joined the channel.
+
+    Usage:
+        @Client.on_message(filters.text)
+        @fsub_required
+        async def handle_url(bot, message):
+            ...
+    """
+    async def wrapper(bot: Client, message: Message):
+        user_id = message.from_user.id if message.from_user else None
+        if not user_id:
+            return
+
+        buttons = await get_fsub_buttons(bot, user_id)
+
+        if buttons:
+            buttons.append([
+                InlineKeyboardButton(
+                    "♻️ I've Joined — Try Again",
+                    callback_data="fsub_check"
+                )
+            ])
+            await message.reply(
+                "<b>⚠️ You must join our channel to use this bot!\n\n"
+                "Join the channel below, then click <i>Try Again</i>.</b>",
+                reply_markup=InlineKeyboardMarkup(buttons),
                 parse_mode=enums.ParseMode.HTML,
-                reply_markup=None,
+                quote=True,
+            )
+            return  # Block
+
+        await func(bot, message)
+
+    return wrapper
+
+
+# ─── "Try Again" callback ─────────────────────────────────────────────────────
+
+@Client.on_callback_query(filters.regex("^fsub_check$"))
+async def fsub_recheck(bot: Client, query: CallbackQuery):
+    """
+    Re-checks membership live when user taps 'Try Again'.
+    If passed → deletes the join message.
+    If failed → shows updated buttons.
+    """
+    user_id = query.from_user.id
+    buttons = await get_fsub_buttons(bot, user_id)
+
+    if buttons:
+        buttons.append([
+            InlineKeyboardButton(
+                "♻️ I've Joined — Try Again",
+                callback_data="fsub_check"
+            )
+        ])
+        await query.answer("🛑 Please join the channel first!", show_alert=True)
+        try:
+            await query.edit_message_reply_markup(
+                reply_markup=InlineKeyboardMarkup(buttons)
             )
         except Exception:
             pass
-        return
-
-    # Left or pending — set pending_agreed and grant access
-    users_col.update_one(
-        {"_id": user_id},
-        {"$set": {"pending_agreed": True}},
-        upsert=True,
-    )
-    await cq.answer("✅ Access granted! Welcome.", show_alert=True)
-    try:
-        await cq.message.edit_text(
-            "✅ <b>Access granted!</b>\n\n"
-            "Send me a YouTube link or use /search to get started. 🎉",
-            parse_mode=enums.ParseMode.HTML,
-            reply_markup=None,
-        )
-    except Exception:
-        pass
-  
+    else:
+        await query.answer("✅ Verified! Now send your YouTube link.", show_alert=True)
+        await query.message.delete()
+            
