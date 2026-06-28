@@ -20,7 +20,7 @@ from helpers.utils import safe_edit
 HELP_TEXT = (
     "🤖 **Bot Guide**\n\n"
     "━━━━━━━━━━━━━━━━━━\n"
-    "📱 **Basic Usage:**\n"
+    "📱 **Unlimited Usage:**\n"
     "① Paste any YouTube link\n"
     "② Choose **MP4** (video) or **MP3** (audio)\n"
     "③ Select your quality\n"
@@ -48,9 +48,9 @@ ABOUT_TEXT = (
     "       **Bot Details**\n"
     "╚━━━━━━━━━━━━━━━━━╝\n"
     "📝 **Name:** AskBotz YT Downloader\n"
-    "👨‍💻 **Developer:** @MN_Bots\n"
+    "👨‍💻 **Developer:** @Master_xkid\n"
     "📢 **Updates:** @AskBotz\n"
-    "💬 **Support:** @AskBotzSupport\n\n"
+    "💬 **Support:** @AskBotz\n\n"
     "╔━━━━━━━━━━━━━━━━━╗\n"
     "     **Technical Specs**\n"
     "╚━━━━━━━━━━━━━━━━━╝\n"
@@ -58,7 +58,7 @@ ABOUT_TEXT = (
     "⚙️ **Framework:** PyroFork\n"
     "🗄️ **Database:** MongoDB\n"
     "☁️ **Hosted on:** VPS\n\n"
-    "⚡ **Built with ❤️ by MN Bots**"
+    "⚡ **Built with ❤️ by AskBotz**"
 )
 
 
