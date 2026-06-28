@@ -277,11 +277,13 @@ async def cb_download(client: Client, cq: CallbackQuery):
         size_mb = dest.stat().st_size / 1e6
         await safe_edit(status, f"📤 **Uploading** `{filename}`...")
 
-        caption = (
-            f"**{title}**\n\n"
-            f"Join ~ {Config.CAPTION_CHANNEL_1}\n"
-            f"Join ~ {Config.CAPTION_CHANNEL_2}"
-        )
+        ch1 = Config.CAPTION_CHANNEL_1.strip()
+        ch2 = Config.CAPTION_CHANNEL_2.strip()
+        caption = f"**{title}**"
+        if ch1:
+            caption += f"\n\n{ch1}"
+        if ch2:
+            caption += f"\n{ch2}"
 
         # ── Upload progress ──────────────────────────────────────────────────
         _up_last  = [time.time()]
