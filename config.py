@@ -18,11 +18,4 @@ class Config:
 
     # Bot UI
     START_IMAGE  = os.environ.get("START_IMAGE",  "https://ibb.co/DP2wDxbq")
-    CHANNEL_LINK = os.environ.get("CHANNEL_LINK", "https://t.me/yourchannel")
-    GROUP_LINK   = os.environ.get("GROUP_LINK",   "https://t.me/yourgroup")
-
-# Flat exports for database.py
-MONGO_URI        = Config.MONGO_URI
-MONGO_DB         = Config.MONGO_DB
-REFERRALS_NEEDED = int(os.environ.get("REFERRALS_NEEDED", "5"))
-ADMINS = list(map(int, os.environ.get("ADMINS", "0").split()))
+    CHANNEL_LINK =
