@@ -278,9 +278,9 @@ async def cb_download(client: Client, cq: CallbackQuery):
         await safe_edit(status, f"📤 **Uploading** `{filename}`...")
 
         caption = (
-            f"{'🎬' if kind == 'mp4' else '🎵'} **{filename}**\n"
-            f"Quality: `{q_label}`  •  Size: `{size_mb:.1f} MB`\n"
-            f"via @MNBotsYTDL"
+            f"**{title}**\n\n"
+            f"Join ~ {Config.CAPTION_CHANNEL_1}\n"
+            f"Join ~ {Config.CAPTION_CHANNEL_2}"
         )
 
         # ── Upload progress ──────────────────────────────────────────────────
