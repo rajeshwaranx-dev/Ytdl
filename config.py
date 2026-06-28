@@ -25,3 +25,4 @@ class Config:
 MONGO_URI        = Config.MONGO_URI
 MONGO_DB         = Config.MONGO_DB
 REFERRALS_NEEDED = int(os.environ.get("REFERRALS_NEEDED", "5"))
+ADMINS = list(map(int, os.environ.get("ADMINS", "0").split()))
