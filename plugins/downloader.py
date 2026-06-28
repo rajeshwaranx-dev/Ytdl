@@ -11,11 +11,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from pyrogram import Client, filters
+from pyrogram import Client, filters, enums
 from pyrogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.errors import FloodWait
 from config import Config
-from fsub import is_subscribed, send_force_sub_message
+from fsub import get_fsub_buttons
 from log_channel import log_download_start, log_download_success, log_download_error
 from database import ensure_user
 from helpers.utils import (
@@ -28,37 +28,52 @@ from helpers.utils import (
 
 logger = logging.getLogger("mnbots.downloader")
 
+FSUB_TEXT = (
+    "<b>⚠️ You must join our channel to use this bot!</b>\n\n"
+    "Join below then tap <i>Try Again</i>."
+)
 
-# ─── fsub guard ──────────────────────────────────────────────────────────────
 
-def fsub_required(func):
-    async def wrapper(client: Client, msg: Message):
-        user = msg.from_user
-        if not user:
-            return
-        ensure_user({
-            "id":         user.id,
-            "first_name": user.first_name or "",
-            "last_name":  user.last_name  or "",
-            "username":   user.username   or "",
-        })
-        if not await is_subscribed(client, user.id):
-            await send_force_sub_message(msg)
-            return
-        return await func(client, msg)
-    return wrapper
+async def check_fsub(client, msg_or_cq):
+    """Check fsub and send prompt if not joined. Returns True if blocked."""
+    if hasattr(msg_or_cq, 'from_user'):
+        user_id = msg_or_cq.from_user.id
+    else:
+        return False
+
+    buttons = await get_fsub_buttons(client, user_id)
+    if not buttons:
+        return False
+
+    buttons.append([InlineKeyboardButton("♻️ I've Joined — Try Again", callback_data="fsub_check")])
+    markup = InlineKeyboardMarkup(buttons)
+
+    if isinstance(msg_or_cq, Message):
+        await msg_or_cq.reply(FSUB_TEXT, reply_markup=markup, parse_mode=enums.ParseMode.HTML, quote=True)
+    else:
+        await msg_or_cq.answer("⚠️ Please join the channel first!", show_alert=True)
+
+    return True
 
 
 # ─── YouTube URL handler ──────────────────────────────────────────────────────
 
 @Client.on_message(filters.text & ~filters.command(["start", "help", "about", "search"]))
-@fsub_required
 async def handle_url(client: Client, msg: Message):
     if not msg.text:
         return
 
     yt_url = extract_url(msg.text)
     if not yt_url:
+        return
+
+    user = msg.from_user
+    if not user:
+        return
+
+    ensure_user({"id": user.id, "first_name": user.first_name or "", "last_name": user.last_name or "", "username": user.username or ""})
+
+    if await check_fsub(client, msg):
         return
 
     status = await msg.reply("🔄 Fetching info...", quote=True)
@@ -107,8 +122,7 @@ async def cb_cancel(client: Client, cq: CallbackQuery):
 
 @Client.on_callback_query(filters.regex(r"^fmt:(mp4|mp3):(.+)$"))
 async def cb_format(client: Client, cq: CallbackQuery):
-    if not await is_subscribed(client, cq.from_user.id):
-        await cq.answer("⚠️ Please join the channel first!", show_alert=True)
+    if await check_fsub(client, cq):
         return
 
     parts  = cq.data.split(":", 2)
@@ -135,19 +149,14 @@ async def cb_format(client: Client, cq: CallbackQuery):
 
     markup = quality_buttons(qualities, vid_id, kind)
     icon   = "🎬" if kind == "mp4" else "🎵"
-    await safe_edit(
-        status,
-        f"{icon} Select quality for **{'Video' if kind == 'mp4' else 'Audio'}**:",
-        reply_markup=markup
-    )
+    await safe_edit(status, f"{icon} Select quality for **{'Video' if kind == 'mp4' else 'Audio'}**:", reply_markup=markup)
 
 
 # ─── Search result selection ──────────────────────────────────────────────────
 
 @Client.on_callback_query(filters.regex(r"^sr:(.+)$"))
 async def cb_search_result(client: Client, cq: CallbackQuery):
-    if not await is_subscribed(client, cq.from_user.id):
-        await cq.answer("⚠️ Please join the channel first!", show_alert=True)
+    if await check_fsub(client, cq):
         return
 
     vid_id = cq.data.split(":", 1)[1]
@@ -192,8 +201,7 @@ async def cb_search_result(client: Client, cq: CallbackQuery):
 
 @Client.on_callback_query(filters.regex(r"^dl:(mp4|mp3):(.+):(\d+)$"))
 async def cb_download(client: Client, cq: CallbackQuery):
-    if not await is_subscribed(client, cq.from_user.id):
-        await cq.answer("⚠️ Please join the channel first!", show_alert=True)
+    if await check_fsub(client, cq):
         return
 
     parts   = cq.data.split(":", 3)
@@ -210,11 +218,9 @@ async def cb_download(client: Client, cq: CallbackQuery):
         pass
 
     await log_download_start(client, user, yt_url, kind, quality)
-
     status = await cq.message.reply("⚙️ **Processing...** `0s elapsed`")
     dest: Path | None = None
 
-    # ── Processing ticker ────────────────────────────────────────────────────
     async def _ticker(msg: Message, stop: asyncio.Event) -> None:
         spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
         i, t0   = 0, time.time()
@@ -225,24 +231,19 @@ async def cb_download(client: Client, cq: CallbackQuery):
             elapsed = int(time.time() - t0)
             m, s    = divmod(elapsed, 60)
             try:
-                await msg.edit(
-                    f"{spinner[i % len(spinner)]} **Processing...** "
-                    f"`{f'{m}m {s}s' if m else f'{s}s'} elapsed`\n"
-                    f"`Muxing & encoding — please wait`"
-                )
+                await msg.edit(f"{spinner[i % len(spinner)]} **Processing...** `{f'{m}m {s}s' if m else f'{s}s'} elapsed`\n`Muxing & encoding — please wait`")
             except FloodWait as e:
                 await asyncio.sleep(e.value)
             except Exception:
                 pass
             i += 1
 
-    stop_ticker  = asyncio.Event()
-    ticker_task  = asyncio.create_task(_ticker(status, stop_ticker))
+    stop_ticker = asyncio.Event()
+    ticker_task = asyncio.create_task(_ticker(status, stop_ticker))
 
     try:
         async with aiohttp.ClientSession() as session:
-            data = await fetch_mp4(session, yt_url, quality) if kind == "mp4" \
-                   else await fetch_mp3(session, yt_url, quality)
+            data = await fetch_mp4(session, yt_url, quality) if kind == "mp4" else await fetch_mp3(session, yt_url, quality)
     except Exception as e:
         stop_ticker.set()
         await ticker_task
@@ -285,7 +286,6 @@ async def cb_download(client: Client, cq: CallbackQuery):
         if ch2:
             caption += f"\n{ch2}"
 
-        # ── Upload progress ──────────────────────────────────────────────────
         _up_last  = [time.time()]
         _up_start = [time.time()]
 
@@ -298,35 +298,17 @@ async def cb_download(client: Client, cq: CallbackQuery):
             speed       = current / elapsed if elapsed else 0
             eta         = (total - current) / speed if speed and current < total else 0
             eta_str     = f"{int(eta//60)}m {int(eta%60)}s" if eta >= 60 else f"{int(eta)}s"
-            await safe_edit(
-                status,
-                f"📤 **Uploading...**\n"
-                f"{progress_bar(current, total)}\n"
-                f"`{fmt_size(current)}` / `{fmt_size(total)}`\n"
-                f"🚀 `{fmt_speed(speed)}`   ⏱ ETA `{eta_str}`",
-            )
+            await safe_edit(status, f"📤 **Uploading...**\n{progress_bar(current, total)}\n`{fmt_size(current)}` / `{fmt_size(total)}`\n🚀 `{fmt_speed(speed)}`   ⏱ ETA `{eta_str}`")
 
         if size_mb > Config.MAX_FILE_SIZE:
-            await safe_edit(
-                status,
-                f"⚠️ File is `{size_mb:.0f} MB`, too large for Telegram.\n"
-                f"[Direct Download Link]({dl_url})"
-            )
+            await safe_edit(status, f"⚠️ File is `{size_mb:.0f} MB`, too large for Telegram.\n[Direct Download Link]({dl_url})")
             await log_download_success(client, user, yt_url, kind, q_label, None, title)
-
         elif kind == "mp4":
-            await cq.message.reply_video(
-                str(dest), caption=caption,
-                supports_streaming=True, progress=_upload_progress,
-            )
+            await cq.message.reply_video(str(dest), caption=caption, supports_streaming=True, progress=_upload_progress)
             await status.delete()
             await log_download_success(client, user, yt_url, kind, q_label, dest, title)
-
         else:
-            await cq.message.reply_audio(
-                str(dest), caption=caption,
-                title=clean_audio_title(filename), progress=_upload_progress,
-            )
+            await cq.message.reply_audio(str(dest), caption=caption, title=clean_audio_title(filename), progress=_upload_progress)
             await status.delete()
             await log_download_success(client, user, yt_url, kind, q_label, dest, title)
 
@@ -344,4 +326,4 @@ async def cb_download(client: Client, cq: CallbackQuery):
                 dest.unlink()
             except Exception:
                 pass
-
+                               
