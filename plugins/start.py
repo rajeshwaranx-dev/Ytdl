@@ -10,17 +10,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from pyrogram import Client, filters
 from pyrogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from config import Config
-from database import users as users_col
-from fsub import is_subscribed, send_force_sub_message
+from database import users as users_col, ensure_user
+from fsub import fsub_required, get_fsub_buttons
 from log_channel import log_new_user
 from helpers.utils import safe_edit
+
 
 # ─── Texts ───────────────────────────────────────────────────────────────────
 
 HELP_TEXT = (
     "🤖 **Bot Guide**\n\n"
     "━━━━━━━━━━━━━━━━━━\n"
-    "📱 **Unlimited Usage:**\n"
+    "📱 **Basic Usage:**\n"
     "① Paste any YouTube link\n"
     "② Choose **MP4** (video) or **MP3** (audio)\n"
     "③ Select your quality\n"
@@ -62,6 +63,8 @@ ABOUT_TEXT = (
 )
 
 
+# ─── Helpers ─────────────────────────────────────────────────────────────────
+
 def _start_markup() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
@@ -88,40 +91,25 @@ def _start_caption(name: str) -> str:
     )
 
 
-# ─── fsub guard decorator ────────────────────────────────────────────────────
-
-def fsub_required(func):
-    async def wrapper(client: Client, msg: Message):
-        user = msg.from_user
-        if not user:
-            return
-        from database import ensure_user
-        ensure_user({
-            "id":         user.id,
-            "first_name": user.first_name or "",
-            "last_name":  user.last_name  or "",
-            "username":   user.username   or "",
-        })
-        if not await is_subscribed(client, user.id):
-            await send_force_sub_message(msg)
-            return
-        return await func(client, msg)
-    return wrapper
-
-
 # ─── /start ──────────────────────────────────────────────────────────────────
 
 @Client.on_message(filters.command("start"))
-@fsub_required
 async def cmd_start(client: Client, msg: Message):
-    user   = msg.from_user
+    user = msg.from_user
+    if not user:
+        return
+    ensure_user({
+        "id":         user.id,
+        "first_name": user.first_name or "",
+        "last_name":  user.last_name  or "",
+        "username":   user.username   or "",
+    })
     is_new = users_col.find_one({"_id": user.id, "downloads": 0}) is not None
     if is_new:
         await log_new_user(client, user)
 
     markup  = _start_markup()
     caption = _start_caption(user.first_name or "User")
-
     try:
         await msg.reply_photo(
             photo=Config.START_IMAGE,
@@ -136,7 +124,6 @@ async def cmd_start(client: Client, msg: Message):
 # ─── /help ───────────────────────────────────────────────────────────────────
 
 @Client.on_message(filters.command("help"))
-@fsub_required
 async def cmd_help(client: Client, msg: Message):
     markup = InlineKeyboardMarkup([
         [InlineKeyboardButton("🏠 Home", callback_data="menu:home")],
@@ -147,7 +134,6 @@ async def cmd_help(client: Client, msg: Message):
 # ─── /about ──────────────────────────────────────────────────────────────────
 
 @Client.on_message(filters.command("about"))
-@fsub_required
 async def cmd_about(client: Client, msg: Message):
     markup = InlineKeyboardMarkup([
         [InlineKeyboardButton("🏠 Home", callback_data="menu:home")],
@@ -159,10 +145,6 @@ async def cmd_about(client: Client, msg: Message):
 
 @Client.on_callback_query(filters.regex(r"^menu:(help|about|home)$"))
 async def cb_menu(client: Client, cq: CallbackQuery):
-    if not await is_subscribed(client, cq.from_user.id):
-        await cq.answer("⚠️ Please join the channel first!", show_alert=True)
-        return
-
     action = cq.data.split(":")[1]
     await cq.answer()
 
@@ -192,13 +174,4 @@ async def cb_menu(client: Client, cq: CallbackQuery):
             await cq.message.edit_text(caption, reply_markup=markup)
         except Exception:
             pass
-
-
-# ─── check_sub callback ───────────────────────────────────────────────────────
-
-from fsub import handle_check_sub
-
-@Client.on_callback_query(filters.regex(r"^check_sub$"))
-async def cb_check_sub(client: Client, cq: CallbackQuery):
-    await handle_check_sub(client, cq)
-    
+            
