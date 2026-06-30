@@ -1,5 +1,6 @@
 """
 plugins/downloader.py — YouTube URL handler and all download-related callbacks.
+FSub is handled globally by fsub.py — no fsub checks needed here.
 """
 
 import sys
@@ -11,11 +12,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from pyrogram import Client, filters, enums
+from pyrogram import Client, filters
 from pyrogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.errors import FloodWait
 from config import Config
-from fsub import get_fsub_buttons
 from log_channel import log_download_start, log_download_success, log_download_error
 from database import ensure_user
 from helpers.utils import (
@@ -28,37 +28,10 @@ from helpers.utils import (
 
 logger = logging.getLogger("mnbots.downloader")
 
-FSUB_TEXT = (
-    "<b>⚠️ You must join our channel to use this bot!</b>\n\n"
-    "Join below then tap <i>Try Again</i>."
-)
-
-
-async def check_fsub(client, msg_or_cq):
-    """Check fsub and send prompt if not joined. Returns True if blocked."""
-    if hasattr(msg_or_cq, 'from_user'):
-        user_id = msg_or_cq.from_user.id
-    else:
-        return False
-
-    buttons = await get_fsub_buttons(client, user_id)
-    if not buttons:
-        return False
-
-    buttons.append([InlineKeyboardButton("♻️ I've Joined — Try Again", callback_data="fsub_check")])
-    markup = InlineKeyboardMarkup(buttons)
-
-    if isinstance(msg_or_cq, Message):
-        await msg_or_cq.reply(FSUB_TEXT, reply_markup=markup, parse_mode=enums.ParseMode.HTML, quote=True)
-    else:
-        await msg_or_cq.answer("⚠️ Please join the channel first!", show_alert=True)
-
-    return True
-
 
 # ─── YouTube URL handler ──────────────────────────────────────────────────────
 
-@Client.on_message(filters.text & ~filters.command(["start", "help", "about", "search"]))
+@Client.on_message(filters.private & filters.text & ~filters.command(["start", "help", "about", "search"]))
 async def handle_url(client: Client, msg: Message):
     if not msg.text:
         return
@@ -72,9 +45,6 @@ async def handle_url(client: Client, msg: Message):
         return
 
     ensure_user({"id": user.id, "first_name": user.first_name or "", "last_name": user.last_name or "", "username": user.username or ""})
-
-    if await check_fsub(client, msg):
-        return
 
     status = await msg.reply("🔄 Fetching info...", quote=True)
     try:
@@ -122,9 +92,6 @@ async def cb_cancel(client: Client, cq: CallbackQuery):
 
 @Client.on_callback_query(filters.regex(r"^fmt:(mp4|mp3):(.+)$"))
 async def cb_format(client: Client, cq: CallbackQuery):
-    if await check_fsub(client, cq):
-        return
-
     parts  = cq.data.split(":", 2)
     kind   = parts[1]
     vid_id = parts[2]
@@ -156,9 +123,6 @@ async def cb_format(client: Client, cq: CallbackQuery):
 
 @Client.on_callback_query(filters.regex(r"^sr:(.+)$"))
 async def cb_search_result(client: Client, cq: CallbackQuery):
-    if await check_fsub(client, cq):
-        return
-
     vid_id = cq.data.split(":", 1)[1]
     yt_url = f"https://youtu.be/{vid_id}"
 
@@ -201,9 +165,6 @@ async def cb_search_result(client: Client, cq: CallbackQuery):
 
 @Client.on_callback_query(filters.regex(r"^dl:(mp4|mp3):(.+):(\d+)$"))
 async def cb_download(client: Client, cq: CallbackQuery):
-    if await check_fsub(client, cq):
-        return
-
     parts   = cq.data.split(":", 3)
     kind    = parts[1]
     vid_id  = parts[2]
@@ -326,4 +287,4 @@ async def cb_download(client: Client, cq: CallbackQuery):
                 dest.unlink()
             except Exception:
                 pass
-                               
+    
