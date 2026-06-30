@@ -1,149 +1,251 @@
 """
-fsub.py — Force Subscribe for YouTube Downloader Bot
-Checked only when user requests a download.
-No DB flags — live membership check every time.
-No fake bypass possible.
+fsub.py — Force Subscribe (TechifyBots approach adapted for AskBotz YT Downloader)
+- Supports normal channels (AUTH_CHANNELS) and approval-required channels (AUTH_REQ_CHANNELS)
+- Auto-deletes fsub message when user joins
+- MongoDB stores join requests — no fake bypass
+- Global handler checks all private messages
 """
 
-import asyncio
 import logging
-from pyrogram import Client, filters, enums
-from pyrogram.errors import UserNotParticipant, ChatAdminRequired
+import datetime
+from motor.motor_asyncio import AsyncIOMotorClient
+from pyrogram import Client, filters, StopPropagation, enums
 from pyrogram.types import (
-    Message, CallbackQuery,
-    InlineKeyboardButton, InlineKeyboardMarkup
+    Message, InlineKeyboardButton, InlineKeyboardMarkup,
+    ChatJoinRequest, ChatMemberUpdated
 )
+from pyrogram.errors import UserNotParticipant, ChatAdminRequired
 from config import Config
 
 logger = logging.getLogger(__name__)
 
-# Cache for invite link (avoids creating new one every check)
-_invite_cache: str | None = None
+
+# ─── DB helper ───────────────────────────────────────────────────────────────
+
+class FsubDB:
+    def __init__(self):
+        client = AsyncIOMotorClient(Config.MONGO_URI)
+        db     = client[Config.MONGO_DB]
+        self.join_requests = db["join_requests"]
+        self.fsub_cache    = db["fsub_cache"]
+
+    async def add_join_req(self, user_id: int, channel_id: int):
+        await self.join_requests.update_one(
+            {"user_id": user_id},
+            {"$addToSet": {"channels": channel_id},
+             "$set": {"created_at": datetime.datetime.utcnow()}},
+            upsert=True
+        )
+
+    async def has_joined_channel(self, user_id: int, channel_id: int) -> bool:
+        doc = await self.join_requests.find_one({"user_id": user_id})
+        return bool(doc and channel_id in doc.get("channels", []))
+
+    async def save_fsub_msg(self, user_id: int, message_id: int):
+        await self.fsub_cache.update_one(
+            {"user_id": user_id},
+            {"$set": {"message_id": message_id,
+                      "created_at": datetime.datetime.utcnow()}},
+            upsert=True
+        )
+
+    async def get_fsub_msg(self, user_id: int):
+        doc = await self.fsub_cache.find_one({"user_id": user_id})
+        return doc.get("message_id") if doc else None
+
+    async def delete_fsub_msg_db(self, user_id: int):
+        await self.fsub_cache.delete_one({"user_id": user_id})
+
+    async def del_all(self):
+        await self.join_requests.drop()
+        await self.fsub_cache.drop()
 
 
-# ─── Core check ──────────────────────────────────────────────────────────────
+db = FsubDB()
 
-async def check_fsub(bot: Client, user_id: int) -> InlineKeyboardButton | None:
-    """
-    Check if user has joined the fsub channel.
-    Returns an InlineKeyboardButton (join button) if not joined, else None.
-    """
-    global _invite_cache
 
-    try:
-        member = await bot.get_chat_member(Config.FSUB_CHANNEL_ID, user_id)
-        if member.status == enums.ChatMemberStatus.BANNED:
-            raise UserNotParticipant
-        return None  # ✅ User is a member
+# ─── Check all channels joined ────────────────────────────────────────────────
 
-    except UserNotParticipant:
+async def check_all_joined(bot: Client, user_id: int) -> bool:
+    for ch in Config.AUTH_CHANNELS:
         try:
-            chat = await bot.get_chat(Config.FSUB_CHANNEL_ID)
-
-            # Use cached invite link or create new one
-            if not _invite_cache:
-                invite = await bot.create_chat_invite_link(
-                    Config.FSUB_CHANNEL_ID,
-                    creates_join_request=True  # supports approval-required channels
-                )
-                _invite_cache = invite.invite_link
-
-            return InlineKeyboardButton(
-                f"📢 Join {chat.title}",
-                url=_invite_cache
-            )
-        except ChatAdminRequired:
-            # Bot not admin — fall back to config link
-            logger.warning("fsub: bot is not admin in FSUB_CHANNEL_ID, using config link")
-            return InlineKeyboardButton("📢 Join Channel", url=Config.FSUB_CHANNEL_LINK)
-        except Exception as e:
-            logger.warning("fsub: could not create invite link: %s", e)
-            return InlineKeyboardButton("📢 Join Channel", url=Config.FSUB_CHANNEL_LINK)
-
-    except Exception as e:
-        logger.exception("fsub: unexpected error for user %s: %s", user_id, e)
-        return None
-
-
-async def get_fsub_buttons(bot: Client, user_id: int) -> list:
-    """
-    Returns list of button rows if user hasn't joined.
-    Empty list [] means user passed fsub check.
-    """
-    btn = await check_fsub(bot, user_id)
-    if btn:
-        return [[btn]]
-    return []
-
-
-# ─── Decorator ───────────────────────────────────────────────────────────────
-
-def fsub_required(func):
-    """
-    Decorator — checks fsub before running any download handler.
-    Only blocks if user hasn't joined the channel.
-
-    Usage:
-        @Client.on_message(filters.text)
-        @fsub_required
-        async def handle_url(bot, message):
-            ...
-    """
-    async def wrapper(bot: Client, message: Message):
-        user_id = message.from_user.id if message.from_user else None
-        if not user_id:
-            return
-
-        buttons = await get_fsub_buttons(bot, user_id)
-
-        if buttons:
-            buttons.append([
-                InlineKeyboardButton(
-                    "♻️ I've Joined — Try Again",
-                    callback_data="fsub_check"
-                )
-            ])
-            await message.reply(
-                "<b>⚠️ You must join our channel to use this bot!\n\n"
-                "Join the channel below, then click <i>Try Again</i>.</b>",
-                reply_markup=InlineKeyboardMarkup(buttons),
-                parse_mode=enums.ParseMode.HTML,
-                quote=True,
-            )
-            return  # Block
-
-        await func(bot, message)
-
-    return wrapper
-
-
-# ─── "Try Again" callback ─────────────────────────────────────────────────────
-
-@Client.on_callback_query(filters.regex("^fsub_check$"))
-async def fsub_recheck(bot: Client, query: CallbackQuery):
-    """
-    Re-checks membership live when user taps 'Try Again'.
-    If passed → deletes the join message.
-    If failed → shows updated buttons.
-    """
-    user_id = query.from_user.id
-    buttons = await get_fsub_buttons(bot, user_id)
-
-    if buttons:
-        buttons.append([
-            InlineKeyboardButton(
-                "♻️ I've Joined — Try Again",
-                callback_data="fsub_check"
-            )
-        ])
-        await query.answer("🛑 Please join the channel first!", show_alert=True)
-        try:
-            await query.edit_message_reply_markup(
-                reply_markup=InlineKeyboardMarkup(buttons)
-            )
+            await bot.get_chat_member(ch, user_id)
+        except UserNotParticipant:
+            return False
         except Exception:
             pass
-    else:
-        await query.answer("✅ Verified! Now send your YouTube link.", show_alert=True)
-        await query.message.delete()
-            
+    for ch in Config.AUTH_REQ_CHANNELS:
+        if not await db.has_joined_channel(user_id, ch):
+            return False
+    return True
+
+
+# ─── Auto-delete fsub message after joining ───────────────────────────────────
+
+async def auto_delete_fsub(client: Client, user_id: int):
+    if not await check_all_joined(client, user_id):
+        return
+    msg_id = await db.get_fsub_msg(user_id)
+    if msg_id:
+        try:
+            await client.delete_messages(user_id, msg_id)
+        except Exception:
+            pass
+        await db.delete_fsub_msg_db(user_id)
+    # Send welcome back message
+    try:
+        user    = await client.get_users(user_id)
+        bot_me  = await client.get_me()
+        await client.send_message(
+            user_id,
+            f"✅ **Welcome {user.mention}!**\n\n"
+            f"You have joined all required channels.\n"
+            f"Now send me a YouTube link to download! 🚀",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    "▶️ Start",
+                    url=f"https://t.me/{bot_me.username}?start=start"
+                )
+            ]])
+        )
+    except Exception as e:
+        logger.error("Failed to send welcome message to %s: %s", user_id, e)
+
+
+# ─── ChatJoinRequest handler (approval-required channels) ────────────────────
+
+def _is_req_channel(_, __, update):
+    return update.chat.id in Config.AUTH_REQ_CHANNELS
+
+
+@Client.on_chat_join_request(filters.create(_is_req_channel))
+async def on_join_request(client: Client, request: ChatJoinRequest):
+    await db.add_join_req(request.from_user.id, request.chat.id)
+    await auto_delete_fsub(client, request.from_user.id)
+
+
+# ─── ChatMemberUpdated handler (normal channels) ─────────────────────────────
+
+@Client.on_chat_member_updated(filters.chat(Config.AUTH_CHANNELS or [0]))
+async def on_member_join(client: Client, update: ChatMemberUpdated):
+    if not update.from_user:
+        return
+    if update.new_chat_member and update.new_chat_member.status in (
+        enums.ChatMemberStatus.MEMBER,
+        enums.ChatMemberStatus.ADMINISTRATOR,
+        enums.ChatMemberStatus.OWNER,
+    ):
+        await auto_delete_fsub(client, update.from_user.id)
+
+
+# ─── Core fsub check ─────────────────────────────────────────────────────────
+
+async def _check_missing(bot: Client, user_id: int) -> list:
+    """Returns list of (title, invite_link) for channels user hasn't joined."""
+    missing = []
+
+    for ch in Config.AUTH_CHANNELS:
+        try:
+            await bot.get_chat_member(ch, user_id)
+        except UserNotParticipant:
+            try:
+                chat   = await bot.get_chat(ch)
+                invite = await bot.create_chat_invite_link(ch)
+                missing.append((chat.title, invite.invite_link))
+            except ChatAdminRequired:
+                missing.append(("Channel", Config.FSUB_CHANNEL_LINK))
+            except Exception:
+                missing.append(("Channel", Config.FSUB_CHANNEL_LINK))
+        except Exception:
+            pass
+
+    for ch in Config.AUTH_REQ_CHANNELS:
+        if not await db.has_joined_channel(user_id, ch):
+            try:
+                chat   = await bot.get_chat(ch)
+                invite = await bot.create_chat_invite_link(ch, creates_join_request=True)
+                missing.append((chat.title, invite.invite_link))
+            except ChatAdminRequired:
+                missing.append(("Channel", Config.FSUB_CHANNEL_LINK))
+            except Exception:
+                missing.append(("Channel", Config.FSUB_CHANNEL_LINK))
+
+    return missing
+
+
+async def get_fsub(bot: Client, message: Message) -> bool:
+    """
+    Returns True if user passed fsub check.
+    Returns False and sends join prompt if not.
+    """
+    user_id = message.from_user.id
+
+    # Admin bypass
+    if user_id in Config.ADMINS:
+        return True
+
+    # Delete old fsub message if exists
+    old_msg_id = await db.get_fsub_msg(user_id)
+    if old_msg_id:
+        try:
+            await bot.delete_messages(user_id, old_msg_id)
+        except Exception:
+            pass
+        await db.delete_fsub_msg_db(user_id)
+
+    missing = await _check_missing(bot, user_id)
+    if not missing:
+        return True
+
+    # Build join buttons
+    buttons = []
+    for i in range(0, len(missing), 2):
+        row = []
+        for j in range(2):
+            if i + j < len(missing):
+                title, link = missing[i + j]
+                row.append(InlineKeyboardButton(f"📢 {title}", url=link))
+        buttons.append(row)
+
+    bot_me = await bot.get_me()
+    buttons.append([InlineKeyboardButton(
+        "🔄 Try Again",
+        url=f"https://t.me/{bot_me.username}?start=start"
+    )])
+
+    msg = await message.reply(
+        f"**🔒 Access Restricted!**\n\n"
+        f"{message.from_user.mention}, to use this bot you must join "
+        f"all required channels.\n\n"
+        f"**Required Channels ({len(missing)})**\n\n"
+        f"After joining, click **Try Again** below.",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+    await db.save_fsub_msg(user_id, msg.id)
+    return False
+
+
+# ─── Global fsub checker (checks ALL private messages) ───────────────────────
+
+@Client.on_message(
+    filters.private & ~filters.bot & ~filters.service & ~filters.me,
+    group=-10
+)
+async def global_fsub_checker(client: Client, message: Message):
+    if not Config.IS_FSUB:
+        return
+    if not message.from_user:
+        return
+    if not await get_fsub(client, message):
+        raise StopPropagation
+
+
+# ─── /delreq admin command ────────────────────────────────────────────────────
+
+@Client.on_message(filters.command("delreq") & filters.private)
+async def del_requests(client: Client, message: Message):
+    if message.from_user.id not in Config.ADMINS:
+        return
+    await db.del_all()
+    await message.reply("✅ Join request cache cleared successfully.")
+        
