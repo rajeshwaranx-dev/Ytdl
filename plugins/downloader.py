@@ -1,6 +1,7 @@
 """
 plugins/downloader.py — YouTube URL handler and all download-related callbacks.
 FSub is handled globally by fsub.py — no fsub checks needed here.
+Supports admin-configurable thumbnail mode (random/youtube/custom) and caption template.
 """
 
 import sys
@@ -17,21 +18,25 @@ from pyrogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineK
 from pyrogram.errors import FloodWait
 from config import Config
 from log_channel import log_download_start, log_download_success, log_download_error
-from database import ensure_user
+from database import ensure_user, get_bot_settings
 from helpers.utils import (
     extract_url, vid_id_from_url, clean_audio_title,
     safe_edit, fetch_info, fetch_mp4, fetch_mp3,
     download_file, quality_buttons, search_result_buttons,
-    progress_bar, fmt_size, fmt_speed,
+    progress_bar, fmt_size, fmt_speed, get_duration,
+    generate_thumbnail, download_youtube_thumbnail,
     DOWNLOAD_DIR,
 )
 
 logger = logging.getLogger("mnbots.downloader")
 
+# Cache video info keyed by vid_id so we have title/thumbnail at download time
+_video_info_cache: dict[str, dict] = {}
+
 
 # ─── YouTube URL handler ──────────────────────────────────────────────────────
 
-@Client.on_message(filters.private & filters.text & ~filters.command(["start", "help", "about", "search"]))
+@Client.on_message(filters.private & filters.text & ~filters.command(["start", "help", "about", "search", "settings", "cancel", "stats", "broadcast", "delreq"]))
 async def handle_url(client: Client, msg: Message):
     if not msg.text:
         return
@@ -56,6 +61,8 @@ async def handle_url(client: Client, msg: Message):
     title  = info.get("title", "Unknown")
     thumb  = info.get("thumbnail", "")
     vid_id = vid_id_from_url(yt_url)
+
+    _video_info_cache[vid_id] = {"title": title, "thumbnail": thumb}
 
     markup = InlineKeyboardMarkup([
         [
@@ -141,6 +148,7 @@ async def cb_search_result(client: Client, cq: CallbackQuery):
 
     title = info.get("title", "Unknown")
     thumb = info.get("thumbnail", "")
+    _video_info_cache[vid_id] = {"title": title, "thumbnail": thumb}
 
     markup = InlineKeyboardMarkup([
         [
@@ -181,6 +189,7 @@ async def cb_download(client: Client, cq: CallbackQuery):
     await log_download_start(client, user, yt_url, kind, quality)
     status = await cq.message.reply("⚙️ **Processing...** `0s elapsed`")
     dest: Path | None = None
+    thumb_path: Path | None = None
 
     async def _ticker(msg: Message, stop: asyncio.Event) -> None:
         spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
@@ -230,22 +239,42 @@ async def cb_download(client: Client, cq: CallbackQuery):
 
         filename = data.get("filename", f"{vid_id}.{kind}")
         q_label  = data.get("quality", str(quality))
-        title    = data.get("title", clean_audio_title(filename))
+        cached   = _video_info_cache.get(vid_id, {})
+        title    = cached.get("title") or data.get("title", clean_audio_title(filename))
+        yt_thumb_url = cached.get("thumbnail", "")
         dest     = DOWNLOAD_DIR / filename
 
         await safe_edit(status, "⬇️ **Downloading...**\n`Starting...`")
         await download_file(dl_url, dest, status)
 
-        size_mb = dest.stat().st_size / 1e6
+        size_mb  = dest.stat().st_size / 1e6
+        duration = await get_duration(dest)
+
+        # ── Thumbnail selection based on admin settings ─────────────────────
+        bot_settings = get_bot_settings()
+        thumb_mode   = bot_settings.get("thumb_mode", "random")
+
+        if kind == "mp4":
+            if thumb_mode == "random":
+                thumb_path = await generate_thumbnail(dest)
+
+            elif thumb_mode == "youtube":
+                jpg_dest = dest.with_suffix(".jpg")
+                thumb_path = await download_youtube_thumbnail(yt_thumb_url, jpg_dest)
+                if not thumb_path:
+                    thumb_path = await generate_thumbnail(dest)  # fallback
+
+            elif thumb_mode == "custom":
+                custom_file_id = bot_settings.get("custom_thumb_file_id")
+                thumb_path = custom_file_id if custom_file_id else await generate_thumbnail(dest)
+
         await safe_edit(status, f"📤 **Uploading** `{filename}`...")
 
-        ch1 = Config.CAPTION_CHANNEL_1.strip()
-        ch2 = Config.CAPTION_CHANNEL_2.strip()
-        caption = f"**{title}**"
-        if ch1:
-            caption += f"\n\n{ch1}"
-        if ch2:
-            caption += f"\n{ch2}"
+        caption_template = bot_settings.get("caption_template", "**{title}**")
+        try:
+            caption = caption_template.replace("{title}", title)
+        except Exception:
+            caption = f"**{title}**"
 
         _up_last  = [time.time()]
         _up_start = [time.time()]
@@ -265,11 +294,12 @@ async def cb_download(client: Client, cq: CallbackQuery):
             await safe_edit(status, f"⚠️ File is `{size_mb:.0f} MB`, too large for Telegram.\n[Direct Download Link]({dl_url})")
             await log_download_success(client, user, yt_url, kind, q_label, None, title)
         elif kind == "mp4":
-            await cq.message.reply_video(str(dest), caption=caption, supports_streaming=True, progress=_upload_progress)
+            thumb_arg = str(thumb_path) if thumb_path else None
+            await cq.message.reply_video(str(dest), caption=caption, supports_streaming=True, duration=duration, thumb=thumb_arg, progress=_upload_progress)
             await status.delete()
             await log_download_success(client, user, yt_url, kind, q_label, dest, title)
         else:
-            await cq.message.reply_audio(str(dest), caption=caption, title=clean_audio_title(filename), progress=_upload_progress)
+            await cq.message.reply_audio(str(dest), caption=caption, title=clean_audio_title(filename), duration=duration, progress=_upload_progress)
             await status.delete()
             await log_download_success(client, user, yt_url, kind, q_label, dest, title)
 
@@ -287,4 +317,10 @@ async def cb_download(client: Client, cq: CallbackQuery):
                 dest.unlink()
             except Exception:
                 pass
+        if thumb_path and isinstance(thumb_path, Path) and thumb_path.exists():
+            try:
+                thumb_path.unlink()
+            except Exception:
+                pass
+        _video_info_cache.pop(vid_id, None)
     
