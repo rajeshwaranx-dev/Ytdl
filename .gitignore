@@ -4,3 +4,14 @@ __pycache__/
 .env
 *.session
 log.txt
+.env
+*.session
+*.session-journal
+venv/
+__pycache__/
+*.pyc
+*.bak
+log.txt
+*.session-shm
+*.session-wal
+*.session*

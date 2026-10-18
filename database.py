@@ -101,3 +101,28 @@ def set_limit(enabled: bool, value: int = None):
     if value is not None:
         update["value"] = value
     settings.update_one({"_id": "limit"}, {"$set": update}, upsert=True)
+
+
+def get_bot_settings() -> dict:
+    doc = settings.find_one({"_id": "bot"}) or {}
+    return {
+        "thumb_mode": doc.get("thumb_mode", "random"),
+        "custom_thumb_file_id": doc.get("custom_thumb_file_id"),
+        "caption_template": doc.get("caption_template", "**{title}**"),
+    }
+
+
+def _set_bot_setting(key: str, value):
+    settings.update_one({"_id": "bot"}, {"$set": {key: value}}, upsert=True)
+
+
+def set_thumb_mode(mode: str):
+    _set_bot_setting("thumb_mode", mode)
+
+
+def set_custom_thumb(file_id: str):
+    _set_bot_setting("custom_thumb_file_id", file_id)
+
+
+def set_caption_template(template: str):
+    _set_bot_setting("caption_template", template)

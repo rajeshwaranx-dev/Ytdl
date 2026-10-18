@@ -215,3 +215,72 @@ def search_result_buttons(results) -> InlineKeyboardMarkup:
     buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="dl:cancel")])
     return InlineKeyboardMarkup(buttons)
 
+
+
+async def get_duration(path) -> int:
+    import asyncio
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffprobe", "-v", "error", "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1", str(path),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        out, _ = await proc.communicate()
+        return int(float(out.decode().strip()))
+    except Exception:
+        return 0
+
+
+async def _make_thumb_jpg(src, dest, seek: float | None = None):
+    """Resize/extract one frame to a Telegram-friendly JPEG. Returns Path or None."""
+    cmd = ["ffmpeg", "-y", "-v", "error"]
+    if seek is not None:
+        cmd += ["-ss", f"{seek:.2f}"]
+    cmd += [
+        "-i", str(src), "-frames:v", "1",
+        "-vf", "scale=320:320:force_original_aspect_ratio=decrease",
+        "-q:v", "5", str(dest),
+    ]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await proc.wait()
+        dest = Path(dest)
+        if dest.exists() and dest.stat().st_size > 0:
+            return dest
+    except Exception as e:
+        logging.getLogger("mnbots.utils").warning("thumb failed: %s", e)
+    return None
+
+
+async def generate_thumbnail(video_path):
+    """Grab a random frame from the video (between 10% and 90% of duration)."""
+    import random
+    video_path = Path(video_path)
+    dur = await get_duration(video_path)
+    seek = random.uniform(dur * 0.1, dur * 0.9) if dur > 2 else 0
+    return await _make_thumb_jpg(video_path, video_path.with_suffix(".thumb.jpg"), seek)
+
+
+async def download_youtube_thumbnail(url, dest):
+    """Download the YouTube thumbnail and shrink it. Returns Path or None."""
+    if not url:
+        return None
+    dest = Path(dest)
+    raw = dest.with_suffix(".raw")
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=20)) as r:
+                if r.status != 200:
+                    return None
+                raw.write_bytes(await r.read())
+        return await _make_thumb_jpg(raw, dest)
+    except Exception as e:
+        logging.getLogger("mnbots.utils").warning("yt thumb failed: %s", e)
+        return None
+    finally:
+        raw.unlink(missing_ok=True)

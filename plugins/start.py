@@ -11,7 +11,6 @@ from pyrogram import Client, filters
 from pyrogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from config import Config
 from database import users as users_col, ensure_user
-from fsub import fsub_required, get_fsub_buttons
 from log_channel import log_new_user
 from helpers.utils import safe_edit
 
